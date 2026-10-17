@@ -15,7 +15,7 @@
 3. 이 저장소 받기
 
    ```bash
-   git clone <저장소 주소> C:\영상다운로드
+   git clone https://github.com/tjdals423-netizen/downloader.git C:\영상다운로드
    ```
 
 4. `영상다운로드.bat` 더블클릭. 처음 실행할 때 필요한 패키지(requests, playwright, imageio-ffmpeg)를 자동 설치.
