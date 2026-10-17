@@ -6,3 +6,4 @@ xiaohongshu/
 *.jpg
 *.part
 __pycache__/
+실패목록.txt
