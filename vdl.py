@@ -157,28 +157,29 @@ def download(url, path, referer, video=False):
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(1 << 16):
                     f.write(chunk)
-        if video:
-            shrink(tmp)
+        res = shrink(tmp) if video else None
         os.replace(tmp, path)
+        return res
     finally:
         tmp.unlink(missing_ok=True)
 
 
 def shrink(path):
-    """MAX_RES보다 큰 영상이면 MAX_RES로 줄여서 덮어씀"""
-    if not MAX_RES:
-        return
+    """MAX_RES보다 큰 영상이면 MAX_RES로 줄여서 덮어씀. (원본 p, 저장된 p) 를 돌려줌"""
     try:
         import imageio_ffmpeg
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         log("(ffmpeg가 없어 원본 해상도로 저장함)")
-        return
+        return None
     probe = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path)], capture_output=True,
                            text=True, encoding="utf-8", errors="replace").stderr
     m = re.search(r"Video:.*?(\d{3,5})x(\d{3,5})", probe)
-    if not m or min(int(m.group(1)), int(m.group(2))) <= MAX_RES:
-        return
+    if not m:
+        return None
+    src = min(int(m.group(1)), int(m.group(2)))  # 세로 영상이든 가로 영상이든 짧은 변 = "몇p"
+    if not MAX_RES or src <= MAX_RES:
+        return src, src
     if _convert_lock.locked():
         log("다른 영상 변환이 끝나길 기다리는 중...")
     with _convert_lock:
@@ -192,9 +193,25 @@ def shrink(path):
         before = path.stat().st_size
         os.replace(tmp, path)
         log(f"변환 완료: {before / 1e6:.0f}MB -> {path.stat().st_size / 1e6:.0f}MB")
-    else:
-        tmp.unlink(missing_ok=True)
-        log("변환 실패 - 원본 해상도로 저장함")
+        return src, MAX_RES
+    tmp.unlink(missing_ok=True)
+    log("변환 실패 - 원본 해상도로 저장함")
+    return src, src
+
+
+UPSCALE_MARK = "★ 업스케일 필요 ★"
+
+
+def res_note(res):
+    """목록.txt 에 적을 해상도 설명 (1080p 미만이면 업스케일 필요 표시)"""
+    if not res:
+        return ""
+    src, out = res
+    if src > out:
+        return f"원본 {src}p (1080p로 줄여서 저장, 업스케일 불필요)"
+    if src < 1080:
+        return f"원본 {src}p   {UPSCALE_MARK}"
+    return f"원본 {src}p (업스케일 불필요)"
 
 
 # ---------------- 더우인 ----------------
@@ -291,7 +308,7 @@ def douyin(url):
         for i, img in enumerate(item["images"], 1):
             files.append(stage_path(".jpg", i))
             download(img["url_list"][-1], files[-1], ref)
-        return files, vid, title
+        return files, vid, title, None
 
     uri = (item or {}).get("video", {}).get("play_addr", {}).get("uri")
     if not uri:
@@ -317,8 +334,8 @@ def douyin(url):
     if not best:
         raise RuntimeError("더우인 영상 다운로드 주소 확인 실패")
     out = stage_path(".mp4")
-    download(best[1], out, ref, video=True)
-    return [out], vid, title
+    res = download(best[1], out, ref, video=True)
+    return [out], vid, title, res
 
 
 # ---------------- 샤오홍슈 ----------------
@@ -371,7 +388,7 @@ def xhs(url):
         for i, img in enumerate(detail.get("imageList", []), 1):
             files.append(stage_path(".jpg", i))
             download(img.get("urlDefault") or img.get("url"), files[-1], ref)
-        return files, note_id, title
+        return files, note_id, title, None
 
     out = stage_path(".mp4")
     streams = []
@@ -395,8 +412,8 @@ def xhs(url):
 
     for u in candidates:
         try:
-            download(u, out, ref, video=True)
-            return [out], note_id, title
+            res = download(u, out, ref, video=True)
+            return [out], note_id, title, res
         except requests.HTTPError:
             continue
     raise RuntimeError("다운로드 가능한 영상 주소를 찾지 못함")
@@ -494,7 +511,7 @@ class Queue:
         except OSError as e:  # 목록.txt 를 다른 프로그램이 잡고 있는 경우 등
             log(f"(목록.txt 기록 실패: {e})")
 
-    def _save(self, n, url, folder, files, item_id, title):
+    def _save(self, n, url, folder, files, item_id, title, res):
         _job.tag, _job.url = f"[{n}]", url
         try:
             if have := already_have(folder, item_id):  # 다른 링크로 같은 영상을 넣은 경우
@@ -508,8 +525,9 @@ class Queue:
                 os.replace(f, SAVE_DIR / folder / names[-1])
             label = names[0] if len(names) == 1 else f"{num}_1~{len(names)}{files[0].suffix}"
             record(folder, label, item_id)
-            log(f"저장됨: {folder}\\{label}  ({title[:30]})")
-            return "ok", f"{folder}\\{label}"
+            note = res_note(res)
+            log(f"저장됨: {folder}\\{label}  {note}")
+            return "ok", f"{folder}\\{label}   {note}".rstrip()
         except Exception as e:
             log(f"!! 저장 실패: {e}")
             return "fail", f"저장 실패: {e}"
@@ -531,6 +549,15 @@ class Queue:
         failed = [r for r in results if r[2] == "fail"]
         line = "=" * 50
         log(f"\n{line}\n완료: 성공 {ok}개 / 이미 있어서 건너뜀 {skip}개 / 실패 {len(failed)}개")
+        upscale = [d.split()[0] for _, _, s, d in results if s == "ok" and UPSCALE_MARK in d]
+        if upscale:
+            msg = f"{UPSCALE_MARK} ({len(upscale)}개, 원본이 1080p 미만): {', '.join(upscale)}"
+            log(f"\n{msg}")
+            try:
+                with open(LIST_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"  -> {msg}\n")
+            except OSError:
+                pass
         if failed:
             log(f"\n!! {len(failed)}개는 받지 못했어요 (최대 {RETRIES}번 시도):")
             for n, u, _, err in failed:
