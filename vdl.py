@@ -8,7 +8,7 @@
   python vdl.py 목록.txt         -> 텍스트 파일 안의 URL 전부 다운로드
 
 파일명은 붙여넣은 순서대로 1.mp4, 2.mp4 ... (사이트별 폴더마다 따로 번호)
-어떤 번호가 어떤 영상인지는 각 폴더의 목록.txt 에 기록됨
+링크별 최종 결과(성공/실패/건너뜀)는 목록.txt 에 실행할 때마다 추가됨
 """
 import json
 import os
@@ -28,7 +28,8 @@ import requests
 SAVE_DIR = Path(__file__).resolve().parent
 TMP_DIR = SAVE_DIR / ".tmp"  # 다운로드/변환 중인 파일 (끝나면 최종 파일만 옮겨짐)
 FAILED_FILE = SAVE_DIR / "실패목록.txt"
-LIST_NAME = "목록.txt"  # 폴더별: 번호 / 영상ID / 제목 / URL
+LIST_FILE = SAVE_DIR / "목록.txt"  # 붙여넣은 순서대로 링크별 최종 결과 (성공/실패/건너뜀)
+HISTORY_FILE = SAVE_DIR / ".기록"  # 받은 영상 ID (숨김, 중복 다운로드 방지용)
 # 최대 해상도 (짧은 변 기준, 1080 = 1080p). 원본 그대로 받으려면 None
 MAX_RES = 1080
 # 동시에 받을 개수 (너무 늘리면 더우인/샤오홍슈가 차단할 수 있음)
@@ -78,16 +79,26 @@ def site_folder(url):
     return None
 
 
-# ---------------- 번호 / 목록 ----------------
-def read_list(folder):
-    f = SAVE_DIR / folder / LIST_NAME
-    if not f.exists():
-        return []
-    return [line.split("\t") for line in f.read_text(encoding="utf-8", errors="replace").splitlines() if line]
+# ---------------- 번호 / 기록 ----------------
+def read_history(folder):
+    """받은 영상 기록 [(파일명, 영상ID)] - 중복 다운로드 방지와 번호 이어붙이기에 사용"""
+    rows = []
+    if HISTORY_FILE.exists():
+        for line in HISTORY_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[0] == folder:
+                rows.append((parts[1], parts[2]))
+    old = SAVE_DIR / folder / "목록.txt"  # 이전 버전이 폴더마다 만들던 기록
+    if old.exists():
+        for line in old.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                rows.append((parts[0], parts[1]))
+    return rows
 
 
 def next_number(folder):
-    """폴더 안의 기존 번호(파일 + 목록.txt) 다음 번호를 붙여넣은 순서대로 배정"""
+    """폴더 안의 기존 번호(파일 + 기록) 다음 번호"""
     with _num_lock:
         if folder not in _next_num:
             used = [0]
@@ -97,8 +108,8 @@ def next_number(folder):
                     m = re.match(r"(\d+)(?:_\d+)?\.\w+$", p.name)
                     if m:
                         used.append(int(m.group(1)))
-            for row in read_list(folder):
-                m = re.match(r"(\d+)", row[0])
+            for name, _ in read_history(folder):
+                m = re.match(r"(\d+)", name)
                 if m:
                     used.append(int(m.group(1)))
             _next_num[folder] = max(used) + 1
@@ -107,17 +118,20 @@ def next_number(folder):
         return n
 
 
-def record(folder, files, item_id, title):
+def record(folder, name, item_id):
     with _num_lock:
-        with open(SAVE_DIR / folder / LIST_NAME, "a", encoding="utf-8") as f:
-            f.write(f"{files}\t{item_id}\t{title}\t{_job.url}\n")
+        new = not HISTORY_FILE.exists()
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{folder}\t{name}\t{item_id}\n")
+        if new and os.name == "nt":
+            subprocess.run(["attrib", "+h", str(HISTORY_FILE)], capture_output=True)
 
 
 def already_have(folder, item_id):
     """같은 영상을 이미 받았으면 그 파일 이름을 돌려줌"""
-    for row in read_list(folder):
-        if len(row) > 1 and row[1] == item_id:
-            return row[0]
+    for name, iid in read_history(folder):
+        if iid == item_id:
+            return name
     for p in (SAVE_DIR / folder).glob(f"*_{item_id}*"):  # 예전 방식(제목_ID.mp4)으로 받은 파일
         return p.name
     return None
@@ -259,7 +273,7 @@ def douyin(url):
     vid = next(g for g in m.groups() if g)
     if have := already_have("douyin", vid):
         log(f"이미 받은 영상이라 건너뜀: {have}")
-        return "skip"
+        return "skip", f"douyin\\{have}"
     log("영상 정보 가져오는 중...")
     for _ in range(2):  # 그래도 안 되면 브라우저를 새로 띄워서 한 번 더
         item, html, page_title = douyin_page(f"https://www.douyin.com/video/{vid}")
@@ -332,7 +346,7 @@ def xhs(url):
     note_id, query = m.group(1), m.group(2) or ""
     if have := already_have("xiaohongshu", note_id):
         log(f"이미 받은 영상이라 건너뜀: {have}")
-        return "skip"
+        return "skip", f"xiaohongshu\\{have}"
 
     detail = None
     for page_url, ua in ((f"https://www.xiaohongshu.com/discovery/item/{note_id}{query}", MOBILE_UA),
@@ -390,7 +404,7 @@ def xhs(url):
 
 # ---------------- 작업 큐 ----------------
 def run_job(n, url):
-    """결과: ("ok", (폴더, 임시파일들, 영상ID, 제목)) / ("skip", "") / ("fail", 실패 이유)"""
+    """결과: ("ok", (폴더, 임시파일들, 영상ID, 제목)) / ("skip", 기존 파일) / ("fail", 실패 이유)"""
     _job.tag, _job.n = f"[{n}]", n
     folder = site_folder(url)
     err = ""
@@ -399,8 +413,8 @@ def run_job(n, url):
             if folder is None:
                 raise Permanent("지원하지 않는 사이트 (더우인/샤오홍슈만 지원)")
             res = douyin(url) if folder == "douyin" else xhs(url)
-            if res == "skip":
-                return "skip", ""
+            if res[0] == "skip":
+                return res
             return "ok", (folder, *res)
         except Permanent as e:
             err = str(e)
@@ -429,6 +443,7 @@ class Queue:
         self.seen = set()
         self.cond = threading.Condition()
         self.closing = False
+        self.list_started = False
         self.saver = threading.Thread(target=self._save_loop, daemon=True)
         self.saver.start()
 
@@ -463,14 +478,28 @@ class Queue:
             if status == "ok":
                 status, data = self._save(n, url, *data)
             self.results.append((n, url, status, data))
+            self._write_list(n, url, status, data)
             i += 1
+
+    def _write_list(self, n, url, status, data):
+        """목록.txt 에 붙여넣은 순서대로 결과 한 줄씩 추가"""
+        info = {"ok": ("성공", data), "skip": ("건너뜀", f"이미 받음 -> {data}"),
+                "fail": ("실패", data)}[status]
+        try:
+            with open(LIST_FILE, "a", encoding="utf-8") as f:
+                if not self.list_started:
+                    f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M')} =====\n")
+                    self.list_started = True
+                f.write(f"{n:>3}. {info[0]}  {info[1]}\n     {url}\n")
+        except OSError as e:  # 목록.txt 를 다른 프로그램이 잡고 있는 경우 등
+            log(f"(목록.txt 기록 실패: {e})")
 
     def _save(self, n, url, folder, files, item_id, title):
         _job.tag, _job.url = f"[{n}]", url
         try:
             if have := already_have(folder, item_id):  # 다른 링크로 같은 영상을 넣은 경우
                 log(f"이미 받은 영상이라 건너뜀: {have}")
-                return "skip", ""
+                return "skip", f"{folder}\\{have}"
             num = next_number(folder)
             (SAVE_DIR / folder).mkdir(exist_ok=True)
             names = []
@@ -478,9 +507,9 @@ class Queue:
                 names.append(f"{num}{f.suffix}" if len(files) == 1 else f"{num}_{i}{f.suffix}")
                 os.replace(f, SAVE_DIR / folder / names[-1])
             label = names[0] if len(names) == 1 else f"{num}_1~{len(names)}{files[0].suffix}"
-            record(folder, label, item_id, title)
+            record(folder, label, item_id)
             log(f"저장됨: {folder}\\{label}  ({title[:30]})")
-            return "ok", ""
+            return "ok", f"{folder}\\{label}"
         except Exception as e:
             log(f"!! 저장 실패: {e}")
             return "fail", f"저장 실패: {e}"
