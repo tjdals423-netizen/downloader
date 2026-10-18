@@ -10,11 +10,11 @@
 
   ```
   ===== 2026-10-17 10:39 =====
-    1. 성공  douyin\1.mp4   원본 1080p (업스케일 불필요)
+    1. 성공  douyin\1.mp4   18.2MB   원본 1080p (업스케일 불필요)
        https://www.douyin.com/video/...
-    2. 성공  xiaohongshu\1.mp4   원본 2160p (1080p로 줄여서 저장, 업스케일 불필요)
+    2. 성공  xiaohongshu\1.mp4   24.7MB   원본 2160p (1080p로 줄여서 저장, 업스케일 불필요)
        http://xhslink.com/o/...
-    3. 성공  douyin\2.mp4   원본 720p   ★ 업스케일 필요 ★
+    3. 성공  douyin\2.mp4   9.4MB   원본 720p   ★ 업스케일 필요 ★
        https://www.douyin.com/video/...
     4. 실패  샤오홍슈 노트 정보 없음 (...)
        https://www.xiaohongshu.com/explore/...
@@ -22,6 +22,7 @@
        https://www.douyin.com/jingxuan?modal_id=...
     -> ★ 업스케일 필요 ★ (1개, 원본이 1080p 미만): douyin\2.mp4
   ```
+- 저장된 최종 파일 크기도 같이 표시 (화면의 `저장됨` 줄과 `목록.txt`)
 - 원본이 1080p 미만인 영상은 `★ 업스케일 필요 ★` 표시 (1080p 이상은 업스케일해도 릴스에서 이득이 거의 없음)
 - 실패하면 자동으로 최대 3번 재시도, 끝까지 실패한 건 마지막에 이유와 함께 알려주고 `실패목록.txt`로 저장
 - 이미 받은 영상은 건너뜀

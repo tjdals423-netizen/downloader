@@ -202,6 +202,15 @@ def shrink(path):
 UPSCALE_MARK = "★ 업스케일 필요 ★"
 
 
+def size_text(n):
+    """파일 크기를 사람이 읽기 쉽게 (12.3MB / 1.25GB)"""
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}MB"
+    return f"{n / 1e3:.0f}KB"
+
+
 def res_note(res):
     """목록.txt 에 적을 해상도 설명 (1080p 미만이면 업스케일 필요 표시)"""
     if not res:
@@ -525,9 +534,10 @@ class Queue:
                 os.replace(f, SAVE_DIR / folder / names[-1])
             label = names[0] if len(names) == 1 else f"{num}_1~{len(names)}{files[0].suffix}"
             record(folder, label, item_id)
+            size = size_text(sum((SAVE_DIR / folder / nm).stat().st_size for nm in names))
             note = res_note(res)
-            log(f"저장됨: {folder}\\{label}  {note}")
-            return "ok", f"{folder}\\{label}   {note}".rstrip()
+            log(f"저장됨: {folder}\\{label}  ({size})  {note}")
+            return "ok", f"{folder}\\{label}   {size}   {note}".rstrip()
         except Exception as e:
             log(f"!! 저장 실패: {e}")
             return "fail", f"저장 실패: {e}"
