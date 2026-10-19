@@ -38,7 +38,7 @@
    git clone https://github.com/tjdals423-netizen/downloader.git C:\영상다운로드
    ```
 
-4. `영상다운로드.bat` 더블클릭. 처음 실행할 때 필요한 패키지(requests, playwright, imageio-ffmpeg, yt-dlp)를 자동 설치.
+4. `영상다운로드.bat` 더블클릭. 필요한 패키지(requests, playwright, imageio-ffmpeg, yt-dlp)가 없으면 프로그램이 실행 중인 파이썬에 자동 설치.
 
 ## 사용법
 

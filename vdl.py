@@ -22,7 +22,23 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
 
-import requests
+
+def _ensure_packages():
+    """필요한 패키지가 없으면 지금 실행 중인 파이썬에 설치 (PATH에 파이썬이 여러 개여도 안전)"""
+    import importlib
+    import importlib.util
+    need = {"requests": "requests", "playwright": "playwright", "imageio_ffmpeg": "imageio-ffmpeg",
+            "yt_dlp": "yt-dlp[default,curl-cffi]", "curl_cffi": "curl-cffi"}
+    missing = [pkg for mod, pkg in need.items() if importlib.util.find_spec(mod) is None]
+    if missing:
+        print(f"필요한 패키지 설치 중... ({', '.join(missing)})", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--disable-pip-version-check",
+                        "--no-warn-script-location", *missing])
+        importlib.invalidate_caches()
+
+
+_ensure_packages()
+import requests  # noqa: E402
 
 # 이 파일이 있는 폴더에 douyin / xiaohongshu / tiktok 폴더를 만들어 저장
 SAVE_DIR = Path(__file__).resolve().parent
