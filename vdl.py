@@ -8,7 +8,7 @@
   python vdl.py 목록.txt         -> 텍스트 파일 안의 URL 전부 다운로드
 
 파일명은 붙여넣은 순서대로 1.mp4, 2.mp4 ... (사이트별 폴더마다 따로 번호)
-링크별 최종 결과(성공/실패/건너뜀)는 목록.txt 에 실행할 때마다 추가됨
+링크별 최종 결과(성공/실패/건너뜀)는 목록 폴더의 날짜.txt 에 기록 (날짜마다 새 파일, 같은 날은 아래에 추가)
 """
 import json
 import os
@@ -28,7 +28,7 @@ import requests
 SAVE_DIR = Path(__file__).resolve().parent
 TMP_DIR = SAVE_DIR / ".tmp"  # 다운로드/변환 중인 파일 (끝나면 최종 파일만 옮겨짐)
 FAILED_FILE = SAVE_DIR / "실패목록.txt"
-LIST_FILE = SAVE_DIR / "목록.txt"  # 붙여넣은 순서대로 링크별 최종 결과 (성공/실패/건너뜀)
+LIST_DIR = SAVE_DIR / "목록"  # 날짜별 목록 파일(2026-10-19.txt): 붙여넣은 순서대로 링크별 최종 결과
 HISTORY_FILE = SAVE_DIR / ".기록"  # 받은 영상 ID (숨김, 중복 다운로드 방지용)
 # 최대 해상도 (짧은 변 기준, 1080 = 1080p). 원본 그대로 받으려면 None
 MAX_RES = 1080
@@ -211,8 +211,23 @@ def size_text(n):
     return f"{n / 1e3:.0f}KB"
 
 
+def video_length(path):
+    """영상 길이를 '15초' / '83초 (1분 23초)' 로. 알 수 없으면 빈 문자열"""
+    try:
+        import imageio_ffmpeg
+        probe = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", str(path)],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace").stderr
+    except Exception:
+        return ""
+    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe)
+    if not m:
+        return ""
+    sec = round(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)))
+    return f"{sec}초" if sec < 60 else f"{sec}초 ({sec // 60}분 {sec % 60}초)"
+
+
 def res_note(res):
-    """목록.txt 에 적을 해상도 설명 (1080p 미만이면 업스케일 필요 표시)"""
+    """목록 파일에 적을 해상도 설명 (1080p 미만이면 업스케일 필요 표시)"""
     if not res:
         return ""
     src, out = res
@@ -469,7 +484,7 @@ class Queue:
         self.seen = set()
         self.cond = threading.Condition()
         self.closing = False
-        self.list_started = False
+        self.list_file = None  # 이번 실행에서 머리줄(===== 시간 =====)을 쓴 목록 파일
         self.saver = threading.Thread(target=self._save_loop, daemon=True)
         self.saver.start()
 
@@ -507,18 +522,24 @@ class Queue:
             self._write_list(n, url, status, data)
             i += 1
 
+    def _append_list(self, text):
+        """오늘 날짜 목록 파일(목록\\2026-10-19.txt)에 추가. 자정을 넘기면 새 날짜 파일로 넘어감"""
+        path = LIST_DIR / f"{time.strftime('%Y-%m-%d')}.txt"
+        LIST_DIR.mkdir(exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            if self.list_file != path:
+                f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M')} =====\n")
+                self.list_file = path
+            f.write(text)
+
     def _write_list(self, n, url, status, data):
-        """목록.txt 에 붙여넣은 순서대로 결과 한 줄씩 추가"""
+        """목록 파일에 붙여넣은 순서대로 결과 한 줄씩 추가"""
         info = {"ok": ("성공", data), "skip": ("건너뜀", f"이미 받음 -> {data}"),
                 "fail": ("실패", data)}[status]
         try:
-            with open(LIST_FILE, "a", encoding="utf-8") as f:
-                if not self.list_started:
-                    f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M')} =====\n")
-                    self.list_started = True
-                f.write(f"{n:>3}. {info[0]}  {info[1]}\n     {url}\n")
-        except OSError as e:  # 목록.txt 를 다른 프로그램이 잡고 있는 경우 등
-            log(f"(목록.txt 기록 실패: {e})")
+            self._append_list(f"{n:>3}. {info[0]}  {info[1]}\n     {url}\n")
+        except OSError as e:  # 목록 파일을 다른 프로그램이 잡고 있는 경우 등
+            log(f"(목록 기록 실패: {e})")
 
     def _save(self, n, url, folder, files, item_id, title, res):
         _job.tag, _job.url = f"[{n}]", url
@@ -535,8 +556,10 @@ class Queue:
             label = names[0] if len(names) == 1 else f"{num}_1~{len(names)}{files[0].suffix}"
             record(folder, label, item_id)
             size = size_text(sum((SAVE_DIR / folder / nm).stat().st_size for nm in names))
+            if names[0].endswith(".mp4"):
+                size = f"{size}   {video_length(SAVE_DIR / folder / names[0])}".rstrip()
             note = res_note(res)
-            log(f"저장됨: {folder}\\{label}  ({size})  {note}")
+            log(f"저장됨: {folder}\\{label}   {size}   {note}")
             return "ok", f"{folder}\\{label}   {size}   {note}".rstrip()
         except Exception as e:
             log(f"!! 저장 실패: {e}")
@@ -564,8 +587,7 @@ class Queue:
             msg = f"{UPSCALE_MARK} ({len(upscale)}개, 원본이 1080p 미만): {', '.join(upscale)}"
             log(f"\n{msg}")
             try:
-                with open(LIST_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"  -> {msg}\n")
+                self._append_list(f"  -> {msg}\n")
             except OSError:
                 pass
         if failed:
