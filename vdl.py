@@ -1,4 +1,4 @@
-"""샤오홍슈 / 더우인 영상 다운로더 (최대 1080p, 워터마크 없음 - 아래 MAX_RES로 변경)
+"""샤오홍슈 / 더우인 / 틱톡 영상 다운로더 (최대 1080p, 워터마크 없음 - 아래 MAX_RES로 변경)
 
 사용법:
   python vdl.py                 -> URL(또는 공유 문구 통째로) 붙여넣기 반복 모드
@@ -24,7 +24,7 @@ from urllib.parse import unquote
 
 import requests
 
-# 이 파일이 있는 폴더에 douyin / xiaohongshu 폴더를 만들어 저장
+# 이 파일이 있는 폴더에 douyin / xiaohongshu / tiktok 폴더를 만들어 저장
 SAVE_DIR = Path(__file__).resolve().parent
 TMP_DIR = SAVE_DIR / ".tmp"  # 다운로드/변환 중인 파일 (끝나면 최종 파일만 옮겨짐)
 FAILED_FILE = SAVE_DIR / "실패목록.txt"
@@ -32,7 +32,7 @@ LIST_DIR = SAVE_DIR / "목록"  # 날짜별 목록 파일(2026-10-19.txt): 붙�
 HISTORY_FILE = SAVE_DIR / ".기록"  # 받은 영상 ID (숨김, 중복 다운로드 방지용)
 # 최대 해상도 (짧은 변 기준, 1080 = 1080p). 원본 그대로 받으려면 None
 MAX_RES = 1080
-# 동시에 받을 개수 (너무 늘리면 더우인/샤오홍슈가 차단할 수 있음)
+# 동시에 받을 개수 (너무 늘리면 사이트에서 차단할 수 있음)
 WORKERS = 3
 # 실패하면 몇 번까지 시도할지
 RETRIES = 3
@@ -48,7 +48,8 @@ MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit
 DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
-URL_RE = re.compile(r"https?://[^\s一-鿿，。！]+")
+# URL 바로 뒤에 붙은 한자/한글/문장부호는 URL이 아님 (예: https://vt.tiktok.com/xxx/이것도)
+URL_RE = re.compile(r"https?://[^\s一-鿿가-힣ㄱ-ㆎ，。！、]+")
 
 
 class Permanent(Exception):
@@ -76,6 +77,8 @@ def site_folder(url):
         return "douyin"
     if "xiaohongshu" in url or "xhslink" in url:
         return "xiaohongshu"
+    if "tiktok.com" in url:
+        return "tiktok"
     return None
 
 
@@ -443,6 +446,72 @@ def xhs(url):
     raise RuntimeError("다운로드 가능한 영상 주소를 찾지 못함")
 
 
+# ---------------- 틱톡 ----------------
+def tiktok(url):
+    """1순위: yt-dlp로 틱톡에서 직접 (MAX_RES 이하 최고화질)
+    2순위: 틱톡 웹에서 영상이 막힌 경우(쇼핑/지역제한 영상 등) tikwm.com 으로 (워터마크 없는 버전)"""
+    import yt_dlp
+
+    class _Silent:  # yt-dlp 자체 오류 출력 숨김 (실패하면 아래에서 tikwm으로 넘어가므로)
+        debug = info = warning = error = staticmethod(lambda msg: None)
+
+    out = stage_path(".mp4")
+    opts = {"quiet": True, "no_warnings": True, "noprogress": True, "logger": _Silent(),
+            "outtmpl": str(out.with_name(out.stem + ".%(ext)s")),
+            "format": "b[vcodec!=none]",  # 영상+소리 합쳐진 파일 (워터마크 버전은 yt-dlp가 알아서 뒤로 미룸)
+            "format_sort": ([f"res:{MAX_RES}"] if MAX_RES else []) + ["vcodec:h264"]}
+    info = None
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError:
+        pass  # 영상 포맷이 없음 -> tikwm 으로
+
+    if info:
+        vid = info["id"]
+        if have := already_have("tiktok", vid):
+            log(f"이미 받은 영상이라 건너뜀: {have}")
+            return "skip", f"tiktok\\{have}"
+        size = info.get("filesize") or info.get("filesize_approx")
+        log(f"다운로드 중{f' ({size / 1e6:.0f}MB)' if size else ''}")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([info["webpage_url"]])
+        got = next(TMP_DIR.glob(out.stem + ".*"), None)
+        if not got:
+            raise RuntimeError("틱톡 다운로드 파일을 찾지 못함")
+        os.replace(got, out)
+        title = safe_name(f"{info.get('uploader', '')}_{info.get('title') or info.get('description', '')}", 100)
+        return [out], vid, title, shrink(out)
+
+    log("틱톡 웹에서 영상이 막혀 있어 tikwm.com 으로 받는 중...")
+    r = requests.post("https://www.tikwm.com/api/", data={"url": url, "hd": 1},
+                      headers={"User-Agent": DESKTOP_UA}, timeout=30)
+    d = r.json()
+    if d.get("code") != 0 or not d.get("data"):
+        raise RuntimeError(f"틱톡 영상 정보를 가져오지 못함 ({d.get('msg') or r.status_code})")
+    x = d["data"]
+    vid = str(x["id"])
+    if have := already_have("tiktok", vid):
+        log(f"이미 받은 영상이라 건너뜀: {have}")
+        return "skip", f"tiktok\\{have}"
+    title = safe_name(f"{(x.get('author') or {}).get('unique_id', '')}_{x.get('title', '')}", 100)
+    ref = "https://www.tikwm.com/"
+    absolute = lambda u: u if u.startswith("http") else "https://www.tikwm.com" + u
+
+    if x.get("images"):  # 사진 게시물
+        files = []
+        for i, u in enumerate(x["images"], 1):
+            files.append(stage_path(".jpg", i))
+            download(absolute(u), files[-1], ref)
+        return files, vid, title, None
+
+    u = x.get("hdplay") or x.get("play")
+    if not u:
+        raise RuntimeError("틱톡 영상 주소를 찾지 못함")
+    res = download(absolute(u), out, ref, video=True)
+    return [out], vid, title, res
+
+
 # ---------------- 작업 큐 ----------------
 def run_job(n, url):
     """결과: ("ok", (폴더, 임시파일들, 영상ID, 제목)) / ("skip", 기존 파일) / ("fail", 실패 이유)"""
@@ -452,8 +521,8 @@ def run_job(n, url):
     for attempt in range(1, RETRIES + 1):
         try:
             if folder is None:
-                raise Permanent("지원하지 않는 사이트 (더우인/샤오홍슈만 지원)")
-            res = douyin(url) if folder == "douyin" else xhs(url)
+                raise Permanent("지원하지 않는 사이트 (더우인/샤오홍슈/틱톡만 지원)")
+            res = {"douyin": douyin, "xiaohongshu": xhs, "tiktok": tiktok}[folder](url)
             if res[0] == "skip":
                 return res
             return "ok", (folder, *res)
@@ -627,7 +696,7 @@ def main():
         q.finish()
         return
     print(f"저장 위치: {SAVE_DIR}   (동시에 {WORKERS}개씩, 실패 시 {RETRIES}번까지 재시도)")
-    print("더우인/샤오홍슈 링크를 붙여넣고 Enter. 받는 동안에도 계속 붙여넣으면 됩니다.")
+    print("더우인/샤오홍슈/틱톡 링크를 붙여넣고 Enter. 받는 동안에도 계속 붙여넣으면 됩니다.")
     print("여러 줄 한 번에 붙여넣기도 OK. 빈 줄 Enter: 진행 중이면 상황 표시, 다 끝났으면 종료.\n")
     try:
         while True:
