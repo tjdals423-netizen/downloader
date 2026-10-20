@@ -1,4 +1,4 @@
-"""샤오홍슈 / 더우인 / 틱톡 영상 다운로더 (최대 1080p, 워터마크 없음 - 아래 MAX_RES로 변경)
+"""샤오홍슈 / 더우인 / 틱톡 / 인스타그램 영상 다운로더 (최대 1080p, 워터마크 없음 - 아래 MAX_RES로 변경)
 
 사용법:
   python vdl.py                 -> URL(또는 공유 문구 통째로) 붙여넣기 반복 모드
@@ -40,7 +40,7 @@ def _ensure_packages():
 _ensure_packages()
 import requests  # noqa: E402
 
-# 이 파일이 있는 폴더에 douyin / xiaohongshu / tiktok 폴더를 만들어 저장
+# 이 파일이 있는 폴더에 douyin / xiaohongshu / tiktok / instagram 폴더를 만들어 저장
 SAVE_DIR = Path(__file__).resolve().parent
 TMP_DIR = SAVE_DIR / ".tmp"  # 다운로드/변환 중인 파일 (끝나면 최종 파일만 옮겨짐)
 FAILED_FILE = SAVE_DIR / "실패목록.txt"
@@ -95,6 +95,8 @@ def site_folder(url):
         return "xiaohongshu"
     if "tiktok.com" in url:
         return "tiktok"
+    if "instagram.com" in url or "instagr.am" in url:
+        return "instagram"
     return None
 
 
@@ -528,6 +530,53 @@ def tiktok(url):
     return [out], vid, title, res
 
 
+# ---------------- 인스타그램 ----------------
+def instagram(url):
+    """yt-dlp로 공개 릴스/게시물 영상을 받음 (로그인 필요 없는 공개 영상만).
+    인스타는 영상/소리가 따로 오는 경우가 많아서 ffmpeg로 합침. 여러 장 게시물은 영상만 전부 받음"""
+    import imageio_ffmpeg
+    import yt_dlp
+
+    class _Silent:
+        debug = info = warning = error = staticmethod(lambda msg: None)
+
+    out = stage_path(".mp4")
+    opts = {"quiet": True, "no_warnings": True, "noprogress": True, "logger": _Silent(),
+            "outtmpl": str(out.with_name(out.stem + "_%(playlist_index|0)s.%(ext)s")),
+            "format": "bv*+ba/b", "merge_output_format": "mp4",
+            "format_sort": ([f"res:{MAX_RES}"] if MAX_RES else []) + ["vcodec:h264"],
+            "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe()}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        if "login" in msg.lower() or "cookies" in msg.lower() or "empty media" in msg:
+            raise Permanent("인스타그램이 영상을 안 보여줌 (로그인 필요한 게시물이거나 삭제/비공개, "
+                            "또는 잠깐 막힘 - 나중에 실패목록.txt로 다시 시도)")
+        if "no video" in msg.lower():
+            raise Permanent("영상이 없는 게시물 (사진만 있음)")
+        raise RuntimeError(f"인스타그램 영상 정보를 가져오지 못함 ({msg.splitlines()[0][:100]})")
+
+    vid = info.get("id") or ""
+    if have := already_have("instagram", vid):
+        log(f"이미 받은 영상이라 건너뜀: {have}")
+        return "skip", f"instagram\\{have}"
+    log("다운로드 중...")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([info.get("webpage_url") or url])
+    got = sorted(TMP_DIR.glob(out.stem + "_*.mp4"))
+    if not got:
+        raise RuntimeError("인스타그램 다운로드 파일을 찾지 못함")
+    files, res = [], None
+    for i, g in enumerate(got):
+        files.append(stage_path(".mp4", i))
+        os.replace(g, files[-1])
+        res = res or shrink(files[-1])
+    title = safe_name(f"{info.get('channel') or info.get('uploader', '')}_{info.get('description', '')}", 100)
+    return files, vid, title, res
+
+
 # ---------------- 작업 큐 ----------------
 def run_job(n, url):
     """결과: ("ok", (폴더, 임시파일들, 영상ID, 제목)) / ("skip", 기존 파일) / ("fail", 실패 이유)"""
@@ -537,8 +586,8 @@ def run_job(n, url):
     for attempt in range(1, RETRIES + 1):
         try:
             if folder is None:
-                raise Permanent("지원하지 않는 사이트 (더우인/샤오홍슈/틱톡만 지원)")
-            res = {"douyin": douyin, "xiaohongshu": xhs, "tiktok": tiktok}[folder](url)
+                raise Permanent("지원하지 않는 사이트 (더우인/샤오홍슈/틱톡/인스타그램만 지원)")
+            res = {"douyin": douyin, "xiaohongshu": xhs, "tiktok": tiktok, "instagram": instagram}[folder](url)
             if res[0] == "skip":
                 return res
             return "ok", (folder, *res)
@@ -712,7 +761,7 @@ def main():
         q.finish()
         return
     print(f"저장 위치: {SAVE_DIR}   (동시에 {WORKERS}개씩, 실패 시 {RETRIES}번까지 재시도)")
-    print("더우인/샤오홍슈/틱톡 링크를 붙여넣고 Enter. 받는 동안에도 계속 붙여넣으면 됩니다.")
+    print("더우인/샤오홍슈/틱톡/인스타그램 링크를 붙여넣고 Enter. 받는 동안에도 계속 붙여넣으면 됩니다.")
     print("여러 줄 한 번에 붙여넣기도 OK. 빈 줄 Enter: 진행 중이면 상황 표시, 다 끝났으면 종료.\n")
     try:
         while True:
