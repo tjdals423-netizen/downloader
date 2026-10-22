@@ -7,7 +7,7 @@
   python vdl.py URL [URL ...]   -> 바로 다운로드
   python vdl.py 목록.txt         -> 텍스트 파일 안의 URL 전부 다운로드
 
-파일명은 붙여넣은 순서대로 1.mp4, 2.mp4 ... (사이트별 폴더마다 따로 번호)
+사이트별 폴더 안에 받은 날짜 폴더로 저장: xiaohongshu\2026-10-22\1.mp4, 2.mp4 ... (날마다 1번부터)
 링크별 최종 결과(성공/실패/건너뜀)는 목록 폴더의 날짜.txt 에 기록 (날짜마다 새 파일, 같은 날은 아래에 추가)
 """
 import json
@@ -46,6 +46,9 @@ TMP_DIR = SAVE_DIR / ".tmp"  # 다운로드/변환 중인 파일 (끝나면 최�
 FAILED_FILE = SAVE_DIR / "실패목록.txt"
 LIST_DIR = SAVE_DIR / "목록"  # 날짜별 목록 파일(2026-10-19.txt): 붙여넣은 순서대로 링크별 최종 결과
 HISTORY_FILE = SAVE_DIR / ".기록"  # 받은 영상 ID (숨김, 중복 다운로드 방지용)
+# 예전처럼 사이트 폴더 바로 아래 있던 영상을 날짜 폴더로 옮긴 기록 (웹 관리 화면이 읽어서 자기 기록을 고침)
+MOVED_FILE = SAVE_DIR / ".옮긴파일.json"
+SITES = ("douyin", "xiaohongshu", "tiktok", "instagram")
 # 최대 해상도 (짧은 변 기준, 1080 = 1080p). 원본 그대로 받으려면 None
 MAX_RES = 1080
 # 동시에 받을 개수 (너무 늘리면 사이트에서 차단할 수 있음)
@@ -118,24 +121,25 @@ def read_history(folder):
     return rows
 
 
-def next_number(folder):
-    """폴더 안의 기존 번호(파일 + 기록) 다음 번호"""
+def next_number(folder, day):
+    """그 날짜 폴더 안의 기존 번호(파일 + 기록) 다음 번호 (날마다 1번부터)"""
     with _num_lock:
-        if folder not in _next_num:
+        key = (folder, day)
+        if key not in _next_num:
             used = [0]
-            d = SAVE_DIR / folder
+            d = SAVE_DIR / folder / day
             if d.exists():
                 for p in d.iterdir():
                     m = re.match(r"(\d+)(?:_\d+)?\.\w+$", p.name)
                     if m:
                         used.append(int(m.group(1)))
             for name, _ in read_history(folder):
-                m = re.match(r"(\d+)", name)
+                m = re.match(rf"{day}[\\/](\d+)", name)  # 기록 이름: 2026-10-22\3.mp4
                 if m:
                     used.append(int(m.group(1)))
-            _next_num[folder] = max(used) + 1
-        n = _next_num[folder]
-        _next_num[folder] += 1
+            _next_num[key] = max(used) + 1
+        n = _next_num[key]
+        _next_num[key] += 1
         return n
 
 
@@ -153,9 +157,53 @@ def already_have(folder, item_id):
     for name, iid in read_history(folder):
         if iid == item_id:
             return name
-    for p in (SAVE_DIR / folder).glob(f"*_{item_id}*"):  # 예전 방식(제목_ID.mp4)으로 받은 파일
-        return p.name
+    for p in (SAVE_DIR / folder).rglob(f"*_{item_id}*"):  # 예전 방식(제목_ID.mp4)으로 받은 파일
+        return str(p.relative_to(SAVE_DIR / folder))
     return None
+
+
+def migrate():
+    """예전처럼 사이트 폴더 바로 아래 있는 영상·사진을 받은 날짜(파일 시각) 폴더로 옮김. 이름(번호)은 그대로.
+    받은 기록(.기록)의 이름도 새 위치로 고치고, 옮긴 목록을 .옮긴파일.json 에 남김 (웹 관리 화면용)."""
+    moved = {}
+    for site in SITES:
+        d = SAVE_DIR / site
+        if not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            if not p.is_file() or p.suffix.lower() not in (".mp4", ".jpg"):
+                continue
+            day = time.strftime("%Y-%m-%d", time.localtime(p.stat().st_mtime))
+            dest = d / day / p.name
+            if dest.exists():
+                continue
+            dest.parent.mkdir(exist_ok=True)
+            os.replace(p, dest)
+            moved[f"{site}/{p.name}"] = f"{site}/{day}/{p.name}"
+    if not moved:
+        return
+    if HISTORY_FILE.exists():  # 숨김 파일은 "w" 로 못 여니 r+ 로 고쳐 씀
+        with open(HISTORY_FILE, "r+", encoding="utf-8") as f:
+            rows = f.read().splitlines()
+            out = []
+            for line in rows:
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    # 여러 개짜리 게시물은 기록에 "3_1~2.mp4" → 첫 파일 3_1.mp4 이 옮겨진 곳
+                    first = re.sub(r"^(\d+)_1~\d+(\.\w+)$", r"\1_1\2", parts[1])
+                    new = moved.get(f"{parts[0]}/{first}")
+                    if new:
+                        parts[1] = new.split("/")[1] + "\\" + parts[1]
+                out.append("\t".join(parts))
+            f.seek(0)
+            f.write("\n".join(out) + "\n")
+            f.truncate()
+    try:
+        old = json.loads(MOVED_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        old = {}
+    MOVED_FILE.write_text(json.dumps({**old, **moved}, ensure_ascii=False, indent=1), encoding="utf-8")
+    log(f"예전 영상 {len(moved)}개를 받은 날짜 폴더로 옮겼어요 (예: {next(iter(moved.values()))})")
 
 
 def stage_path(ext, idx=0):
@@ -681,17 +729,19 @@ class Queue:
             if have := already_have(folder, item_id):  # 다른 링크로 같은 영상을 넣은 경우
                 log(f"이미 받은 영상이라 건너뜀: {have}")
                 return "skip", f"{folder}\\{have}"
-            num = next_number(folder)
-            (SAVE_DIR / folder).mkdir(exist_ok=True)
+            day = time.strftime("%Y-%m-%d")  # 사이트 폴더 안 날짜 폴더 (날마다 1번부터)
+            num = next_number(folder, day)
+            dest = SAVE_DIR / folder / day
+            dest.mkdir(parents=True, exist_ok=True)
             names = []
             for i, f in enumerate(files, 1):
                 names.append(f"{num}{f.suffix}" if len(files) == 1 else f"{num}_{i}{f.suffix}")
-                os.replace(f, SAVE_DIR / folder / names[-1])
-            label = names[0] if len(names) == 1 else f"{num}_1~{len(names)}{files[0].suffix}"
+                os.replace(f, dest / names[-1])
+            label = day + "\\" + (names[0] if len(names) == 1 else f"{num}_1~{len(names)}{files[0].suffix}")
             record(folder, label, item_id)
-            size = size_text(sum((SAVE_DIR / folder / nm).stat().st_size for nm in names))
+            size = size_text(sum((dest / nm).stat().st_size for nm in names))
             if names[0].endswith(".mp4"):
-                size = f"{size}   {video_length(SAVE_DIR / folder / names[0])}".rstrip()
+                size = f"{size}   {video_length(dest / names[0])}".rstrip()
             note = res_note(res)
             log(f"저장됨: {folder}\\{label}   {size}   {note}")
             return "ok", f"{folder}\\{label}   {size}   {note}".rstrip()
@@ -751,6 +801,10 @@ def main():
     TMP_DIR.mkdir(exist_ok=True)
     if os.name == "nt":
         subprocess.run(["attrib", "+h", str(TMP_DIR)], capture_output=True)
+    try:
+        migrate()  # 예전 방식(사이트 폴더 바로 아래)으로 받은 영상을 날짜 폴더로 (한 번만, 이후엔 할 일 없음)
+    except OSError as e:
+        log(f"(예전 영상 날짜 폴더로 옮기기 실패: {e})")
     q = Queue()
     if len(sys.argv) > 1:
         for arg in sys.argv[1:]:
