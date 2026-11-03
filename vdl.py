@@ -94,7 +94,7 @@ def resolve(url, ua):
 def site_folder(url):
     if "douyin" in url:
         return "douyin"
-    if "xiaohongshu" in url or "xhslink" in url:
+    if "xiaohongshu" in url or "xhslink" in url or "rednote" in url:
         return "xiaohongshu"
     if "tiktok.com" in url:
         return "tiktok"
