@@ -1,4 +1,4 @@
-"""샤오홍슈 / 더우인 / 틱톡 / 인스타그램 영상 다운로더 (최대 1080p, 워터마크 없음 - 아래 MAX_RES로 변경)
+"""샤오홍슈 / 더우인 / 틱톡 / 인스타그램 / 유튜브 영상 다운로더 (최대 1080p, 워터마크 없음 - 아래 MAX_RES로 변경)
 
 사용법:
   python vdl.py                 -> URL(또는 공유 문구 통째로) 붙여넣기 반복 모드
@@ -40,7 +40,7 @@ def _ensure_packages():
 _ensure_packages()
 import requests  # noqa: E402
 
-# 이 파일이 있는 폴더에 douyin / xiaohongshu / tiktok / instagram 폴더를 만들어 저장
+# 이 파일이 있는 폴더에 douyin / xiaohongshu / tiktok / instagram / youtube 폴더를 만들어 저장
 SAVE_DIR = Path(__file__).resolve().parent
 TMP_DIR = SAVE_DIR / ".tmp"  # 다운로드/변환 중인 파일 (끝나면 최종 파일만 옮겨짐)
 FAILED_FILE = SAVE_DIR / "실패목록.txt"
@@ -48,7 +48,7 @@ LIST_DIR = SAVE_DIR / "목록"  # 날짜별 목록 파일(2026-10-19.txt): 붙�
 HISTORY_FILE = SAVE_DIR / ".기록"  # 받은 영상 ID (숨김, 중복 다운로드 방지용)
 # 예전처럼 사이트 폴더 바로 아래 있던 영상을 날짜 폴더로 옮긴 기록 (웹 관리 화면이 읽어서 자기 기록을 고침)
 MOVED_FILE = SAVE_DIR / ".옮긴파일.json"
-SITES = ("douyin", "xiaohongshu", "tiktok", "instagram")
+SITES = ("douyin", "xiaohongshu", "tiktok", "instagram", "youtube")
 # 최대 해상도 (짧은 변 기준, 1080 = 1080p). 원본 그대로 받으려면 None
 MAX_RES = 1080
 # 동시에 받을 개수 (너무 늘리면 사이트에서 차단할 수 있음)
@@ -100,6 +100,8 @@ def site_folder(url):
         return "tiktok"
     if "instagram.com" in url or "instagr.am" in url:
         return "instagram"
+    if "youtube.com" in url or "youtu.be" in url:
+        return "youtube"
     return None
 
 
@@ -625,6 +627,56 @@ def instagram(url):
     return files, vid, title, res
 
 
+# ---------------- 유튜브 ----------------
+def youtube(url):
+    """yt-dlp로 일반 영상/쇼츠 한 개를 받음 (재생목록 링크여도 그 영상 하나만).
+    유튜브에 있는 MAX_RES 이하 H.264 파일을 바로 받아 소리와 합치므로 보통 변환이 필요 없음"""
+    import imageio_ffmpeg
+    import yt_dlp
+
+    if not re.search(r"youtu\.be/[\w-]+|[?&]v=[\w-]+|/(?:shorts|live|embed)/[\w-]+", url):
+        raise Permanent("유튜브 영상 링크가 아님 (채널/재생목록 전체는 지원 안 함)")
+
+    class _Silent:
+        debug = info = warning = error = staticmethod(lambda msg: None)
+
+    out = stage_path(".mp4")
+    opts = {"quiet": True, "no_warnings": True, "noprogress": True, "logger": _Silent(), "noplaylist": True,
+            "outtmpl": str(out.with_name(out.stem + ".%(ext)s")),
+            "format": "bv*+ba/b", "merge_output_format": "mp4",
+            "format_sort": ([f"res:{MAX_RES}"] if MAX_RES else []) + ["vcodec:h264", "acodec:aac"],
+            "js_runtimes": {"deno": {}, "node": {}},  # 있으면 사용 (없어도 대부분 받아짐)
+            "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe()}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        low = msg.lower()
+        if "not a bot" in low:
+            raise RuntimeError("유튜브가 잠깐 막음 (봇 확인 요청)")
+        if "age" in low and "sign in" in low:
+            raise Permanent("연령 제한 영상 (로그인 필요)")
+        if any(k in low for k in ("private video", "unavailable", "members-only", "has been removed")):
+            raise Permanent("볼 수 없는 영상 (삭제/비공개/멤버십 전용)")
+        raise RuntimeError(f"유튜브 영상 정보를 가져오지 못함 ({msg.splitlines()[0][:100]})")
+
+    if info.get("is_live") or info.get("live_status") == "is_upcoming":
+        raise Permanent("라이브 중이거나 예정인 영상은 받을 수 없음 (끝난 뒤 다시 시도)")
+    vid = info["id"]
+    if have := already_have("youtube", vid):
+        log(f"이미 받은 영상이라 건너뜀: {have}")
+        return "skip", f"youtube\\{have}"
+    size = sum(f.get("filesize") or f.get("filesize_approx") or 0 for f in info.get("requested_formats") or [])
+    log(f"다운로드 중{f' ({size / 1e6:.0f}MB)' if size else '...'}")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([info.get("webpage_url") or url])
+    if not out.exists():
+        raise RuntimeError("유튜브 다운로드 파일을 찾지 못함")
+    title = safe_name(f"{info.get('channel') or info.get('uploader', '')}_{info.get('title', '')}", 100)
+    return [out], vid, title, shrink(out)
+
+
 # ---------------- 작업 큐 ----------------
 def run_job(n, url):
     """결과: ("ok", (폴더, 임시파일들, 영상ID, 제목)) / ("skip", 기존 파일) / ("fail", 실패 이유)"""
@@ -634,8 +686,9 @@ def run_job(n, url):
     for attempt in range(1, RETRIES + 1):
         try:
             if folder is None:
-                raise Permanent("지원하지 않는 사이트 (더우인/샤오홍슈/틱톡/인스타그램만 지원)")
-            res = {"douyin": douyin, "xiaohongshu": xhs, "tiktok": tiktok, "instagram": instagram}[folder](url)
+                raise Permanent("지원하지 않는 사이트 (더우인/샤오홍슈/틱톡/인스타그램/유튜브만 지원)")
+            res = {"douyin": douyin, "xiaohongshu": xhs, "tiktok": tiktok, "instagram": instagram,
+                   "youtube": youtube}[folder](url)
             if res[0] == "skip":
                 return res
             return "ok", (folder, *res)
@@ -815,7 +868,7 @@ def main():
         q.finish()
         return
     print(f"저장 위치: {SAVE_DIR}   (동시에 {WORKERS}개씩, 실패 시 {RETRIES}번까지 재시도)")
-    print("더우인/샤오홍슈/틱톡/인스타그램 링크를 붙여넣고 Enter. 받는 동안에도 계속 붙여넣으면 됩니다.")
+    print("더우인/샤오홍슈/틱톡/인스타그램/유튜브 링크를 붙여넣고 Enter. 받는 동안에도 계속 붙여넣으면 됩니다.")
     print("여러 줄 한 번에 붙여넣기도 OK. 빈 줄 Enter: 진행 중이면 상황 표시, 다 끝났으면 종료.\n")
     try:
         while True:
