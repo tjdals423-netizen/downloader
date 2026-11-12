@@ -155,10 +155,13 @@ def record(folder, name, item_id):
 
 
 def already_have(folder, item_id):
-    """같은 영상을 이미 받았으면 그 파일 이름을 돌려줌"""
+    """같은 영상을 이미 받았으면 그 파일 이름을 돌려줌.
+    기록에 있어도 파일을 지웠으면 다시 받음 (안 열리는 파일을 지우고 다시 받을 수 있게, 2026-11-12)"""
     for name, iid in read_history(folder):
         if iid == item_id:
-            return name
+            first = re.sub(r"_(\d+)~\d+(\.\w+)$", r"_\1\2", name)   # 여러 개짜리 '3_1~2.mp4' → 3_1.mp4
+            if (SAVE_DIR / folder / name).exists() or (SAVE_DIR / folder / first).exists():
+                return name
     for p in (SAVE_DIR / folder).rglob(f"*_{item_id}*"):  # 예전 방식(제목_ID.mp4)으로 받은 파일
         return str(p.relative_to(SAVE_DIR / folder))
     return None
@@ -236,7 +239,9 @@ def download(url, path, referer, video=False):
 
 
 def shrink(path):
-    """MAX_RES보다 큰 영상이면 MAX_RES로 줄여서 덮어씀. (원본 p, 저장된 p) 를 돌려줌"""
+    """MAX_RES보다 큰 영상이면 MAX_RES로 줄여서 덮어씀. (원본 p, 저장된 p) 를 돌려줌.
+    H.264가 아닌 영상(AV1·H.265 등)도 H.264로 바꿈 — 윈도우 기본 플레이어에서 안 열리고 Vmake도
+    '지원하지 않는 포맷'으로 거부하는 경우가 있어서 (2026-11-12, 샤오홍슈 영상 3개)"""
     try:
         import imageio_ffmpeg
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -248,25 +253,29 @@ def shrink(path):
     m = re.search(r"Video:.*?(\d{3,5})x(\d{3,5})", probe)
     if not m:
         return None
+    codec = (re.search(r"Video: (\w+)", probe) or [None, ""])[1].lower()
     src = min(int(m.group(1)), int(m.group(2)))  # 세로 영상이든 가로 영상이든 짧은 변 = "몇p"
-    if not MAX_RES or src <= MAX_RES:
+    big = bool(MAX_RES and src > MAX_RES)
+    if not big and codec == "h264":
         return src, src
     if _convert_lock.locked():
         log("다른 영상 변환이 끝나길 기다리는 중...")
     with _convert_lock:
-        log(f"{m.group(1)}x{m.group(2)} -> {MAX_RES}p 로 변환 중... (영상 길이에 따라 수십 초)")
+        why = f"{m.group(1)}x{m.group(2)} -> {MAX_RES}p" if big else f"{codec or '?'} -> H.264"
+        log(f"{why} 로 변환 중... (영상 길이에 따라 수십 초)")
         tmp = path.with_name(path.stem + ".converting.mp4")
-        vf = f"scale='if(gt(iw,ih),-2,{MAX_RES})':'if(gt(iw,ih),{MAX_RES},-2)'"
-        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), "-vf", vf,
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "copy",
+        vf = (["-vf", f"scale='if(gt(iw,ih),-2,{MAX_RES})':'if(gt(iw,ih),{MAX_RES},-2)'"] if big else [])
+        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), *vf,
+                            "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                             "-movflags", "+faststart", str(tmp)], capture_output=True)
     if r.returncode == 0 and tmp.exists():
         before = path.stat().st_size
         os.replace(tmp, path)
         log(f"변환 완료: {before / 1e6:.0f}MB -> {path.stat().st_size / 1e6:.0f}MB")
-        return src, MAX_RES
+        return src, (MAX_RES if big else src)
     tmp.unlink(missing_ok=True)
-    log("변환 실패 - 원본 해상도로 저장함")
+    log(f"변환 실패 - 원본 그대로 저장함 ({codec or '?'}, 안 열리면 이 영상은 다시 받아 주세요)")
     return src, src
 
 
@@ -490,9 +499,10 @@ def xhs(url):
     for codec, lst in (video.get("media", {}).get("stream") or {}).items():
         for s in lst or []:
             if s.get("masterUrl"):
-                streams.append(s)
+                streams.append({**s, "_h264": codec.lower() == "h264"})
     short = lambda s: min(s.get("width") or 0, s.get("height") or 0)
-    streams.sort(key=lambda s: (short(s), s.get("videoBitrate") or s.get("avgBitrate") or 0), reverse=True)
+    # 같은 화질이면 H.264 먼저 (AV1·H.265는 윈도우·Vmake에서 안 열리는 경우가 있음, 2026-11-12)
+    streams.sort(key=lambda s: (short(s), s["_h264"], s.get("videoBitrate") or s.get("avgBitrate") or 0), reverse=True)
 
     candidates = []
     # 1순위: 딱 MAX_RES 화질 스트림이 있으면 그대로 (변환 불필요)
